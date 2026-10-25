@@ -1,0 +1,114 @@
+name: seal-build
+
+# golang.org/x/net has no GitHub Actions CI of its own (upstream tests on the
+# Go project's LUCI builders, against the two supported Go releases). This
+# workflow mirrors that: `go build ./...` + `go test ./...` on Go 1.24 (the
+# go.mod minimum) and Go 1.25, and packs the module zip with
+# golang.org/x/mod/zip.CreateFromDir, the proxy's own zip implementation.
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated top-level Go test names to run (empty = full suite)"
+        required: false
+        default: ""
+
+env:
+  MODULE_PATH: golang.org/x/net
+  MODULE_VERSION: v0.45.0
+  # Dependencies resolve from go.sum (every version pinned by the release);
+  # the default proxy.golang.org serves them.
+  GOTOOLCHAIN: local
+
+jobs:
+  build-test:
+    name: go ${{ matrix.go }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.24.x", "1.25.x"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+
+      - name: Go version
+        run: go version && go env
+
+      - name: Pack module zip
+        if: matrix.go == '1.24.x'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Zip a copy of the module tree without this build workflow: the
+          # public module zip ships no .github/ directory.
+          src="$RUNNER_TEMP/modsrc"
+          rm -rf "$src" && mkdir -p "$src"
+          cp -a "$GITHUB_WORKSPACE/." "$src/"
+          rm -rf "$src/.git" "$src/.github/workflows/seal-build.yml"
+          helper="$RUNNER_TEMP/ziphelper"
+          mkdir -p "$helper" "$RUNNER_TEMP/build_output"
+          cat > "$helper/main.go" <<'EOF'
+          package main
+
+          import (
+                  "log"
+                  "os"
+
+                  "golang.org/x/mod/module"
+                  "golang.org/x/mod/zip"
+          )
+
+          func main() {
+                  if len(os.Args) != 5 {
+                      log.Fatal("usage: zip <module-path> <version> <source-dir> <output-zip>")
+                  }
+                  m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+                  f, err := os.Create(os.Args[4])
+                  if err != nil {
+                      log.Fatal(err)
+                  }
+                  defer f.Close()
+                  if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                      log.Fatal(err)
+                  }
+                  log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          cd "$helper"
+          go mod init example.com/ziphelper
+          go get golang.org/x/mod@v0.28.0
+          go run . "$MODULE_PATH" "$MODULE_VERSION" "$src" "$RUNNER_TEMP/build_output/$MODULE_VERSION.zip"
+          unzip -l "$RUNNER_TEMP/build_output/$MODULE_VERSION.zip" | tail -1
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        shell: bash
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -eo pipefail
+          if [ -n "$TEST_FILTER" ]; then
+            go test -v -run "^($(echo "$TEST_FILTER" | tr ' ' '|'))$" ./... 2>&1 | tee "$RUNNER_TEMP/scoped.log"
+            for t in $TEST_FILTER; do grep -qE "^=== RUN[[:space:]]+${t}(/|$)" "$RUNNER_TEMP/scoped.log" || { echo "selected test $t did not run"; exit 1; }; done
+          else
+            go test -v ./... 2>&1 | tee "$RUNNER_TEMP/full.log"
+            echo "Per-package results:"
+            awk '/^(ok|FAIL|\?)[[:space:]]/' "$RUNNER_TEMP/full.log"
+            awk -v go="${{ matrix.go }}" '/--- PASS/{p++} /--- FAIL/{f++} /--- SKIP/{s++} END{printf "TEST SUMMARY (go %s): %d passed, %d failed, %d skipped\n", go, p, f, s}' "$RUNNER_TEMP/full.log"
+          fi
+
+      - name: Upload module zip
+        if: matrix.go == '1.24.x'
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/build_output/*.zip
+          if-no-files-found: error
